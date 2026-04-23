@@ -1,15 +1,33 @@
 import json
+import os
+import subprocess
+import sys
+import traceback
+import uuid
 from pathlib import Path
 from typing import Dict, List
 
 from colorama import Fore, Style, init
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.utils import secure_filename
 
 
 APP_HOST = "127.0.0.1"
 APP_PORT = 5000
+BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = Path.cwd() / "survey_outputs"
+UPLOAD_DIR = BASE_DIR / "uploads"
+CONDA_PREFIX_PYTHON = BASE_DIR / "venv" / "python.exe"
+VENV_SCRIPTS_PYTHON = BASE_DIR / "venv" / "Scripts" / "python.exe"
+if CONDA_PREFIX_PYTHON.exists():
+    PYTHON_EXE = CONDA_PREFIX_PYTHON
+elif VENV_SCRIPTS_PYTHON.exists():
+    PYTHON_EXE = VENV_SCRIPTS_PYTHON
+else:
+    PYTHON_EXE = Path(sys.executable).resolve()
+ALLOWED_UPLOAD_EXTENSIONS = {".tif", ".tiff"}
 
 
 def ensure_output_directory() -> None:
@@ -102,6 +120,24 @@ def detect_datasets() -> Dict[str, List[Dict[str, str]]]:
 
 app = Flask(__name__)
 CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 * 1024  # 10 GB
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+upload_jobs: Dict[str, Dict[str, str]] = {}
+upload_processes: Dict[str, subprocess.Popen] = {}
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_file_too_large(_error):
+    return (
+        jsonify(
+            {
+                "error": "Upload too large. Current limit is 10 GB.",
+                "details": "Please upload a smaller TIFF, or reduce file size before upload.",
+            }
+        ),
+        413,
+    )
 
 
 INDEX_HTML = """<!doctype html>
@@ -110,6 +146,10 @@ INDEX_HTML = """<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Droid Survair - Local Survey Viewer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
   <link rel="stylesheet" href="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Widgets/widgets.css" />
   <style>
@@ -125,7 +165,11 @@ INDEX_HTML = """<!doctype html>
     }
 
     * { box-sizing: border-box; }
-    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: "Segoe UI", Tahoma, sans-serif; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: "Montserrat", sans-serif; }
+
+    .fa, .fas, .far, .fal, .fab, [class^="fa-"], [class*=" fa-"] {
+      font-weight: 900 !important;
+    }
 
     .app {
       display: grid;
@@ -165,6 +209,147 @@ INDEX_HTML = """<!doctype html>
       padding: 12px;
       overflow: auto;
       flex: 1;
+    }
+
+    .upload-panel {
+      margin: 8px 12px 0;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .upload-title {
+      font-size: 12px;
+      color: var(--yellow);
+      margin: 0 0 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .upload-zone {
+      border: 1px dashed #3f6d78;
+      border-radius: 10px;
+      padding: 12px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s ease, background 0.2s ease;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .upload-zone:hover {
+      border-color: var(--cyan);
+      background: rgba(0, 229, 255, 0.06);
+    }
+
+    .upload-zone i {
+      display: block;
+      font-size: 18px;
+      color: var(--cyan);
+      margin-bottom: 6px;
+    }
+
+    .upload-zone input {
+      display: none;
+    }
+
+    .upload-job-list {
+      margin-top: 10px;
+      max-height: 120px;
+      overflow: auto;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .upload-job {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+      margin-bottom: 6px;
+      background: rgba(0, 0, 0, 0.1);
+    }
+
+    .upload-job-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+
+    .upload-job-name {
+      color: var(--text);
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .upload-job-state {
+      color: var(--muted);
+      text-transform: uppercase;
+      font-size: 10px;
+      letter-spacing: 0.6px;
+    }
+
+    .upload-progress {
+      height: 7px;
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.06);
+      margin: 5px 0;
+    }
+
+    .upload-progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #00e5ff, #ffe45e);
+      transition: width 0.35s ease;
+    }
+
+    .upload-progress-text {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 3px;
+    }
+
+    .upload-error {
+      margin-top: 8px;
+      border: 1px solid #8e3a42;
+      background: rgba(255, 107, 107, 0.1);
+      border-radius: 8px;
+      padding: 8px;
+      font-size: 11px;
+      color: #ffb3b3;
+      display: none;
+    }
+
+    .upload-error button {
+      margin-top: 6px;
+      border: 1px solid #ac5a62;
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.2);
+      color: #ffd6d6;
+      padding: 4px 8px;
+      cursor: pointer;
+      font-size: 11px;
+      font-family: "Montserrat", sans-serif;
+    }
+
+    .upload-error pre {
+      margin: 8px 0 0;
+      max-height: 140px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid #6b2f35;
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.25);
+      padding: 6px;
+      display: none;
+      color: #ffdede;
     }
 
     .group-title {
@@ -245,6 +430,20 @@ INDEX_HTML = """<!doctype html>
         <h1 class="brand">Droid Survair - Master Suite</h1>
         <p class="subtitle">Local Survey Viewer</p>
       </div>
+      <section class="upload-panel">
+        <h2 class="upload-title"><i class="fa-solid fa-cloud-arrow-up"></i> Upload TIFF</h2>
+        <label class="upload-zone">
+          <i class="fa-solid fa-file-arrow-up"></i>
+          Drag/Click to upload .tif/.tiff
+          <input id="uploadInput" type="file" accept=".tif,.tiff" />
+        </label>
+        <div id="uploadJobs" class="upload-job-list"></div>
+        <div id="uploadError" class="upload-error">
+          <div id="uploadErrorText"></div>
+          <button id="toggleUploadLogs" type="button"><i class="fa-solid fa-bug"></i> Show Logs</button>
+          <pre id="uploadErrorDetails"></pre>
+        </div>
+      </section>
       <div id="datasetGroups" class="dataset-groups"></div>
       <div id="status" class="status">Ready. Select a dataset to visualize.</div>
     </aside>
@@ -270,6 +469,12 @@ INDEX_HTML = """<!doctype html>
     const emptyStateEl = document.getElementById("emptyState");
     const mapEl = document.getElementById("map");
     const cesiumEl = document.getElementById("cesiumContainer");
+    const uploadInput = document.getElementById("uploadInput");
+    const uploadJobsEl = document.getElementById("uploadJobs");
+    const uploadErrorEl = document.getElementById("uploadError");
+    const uploadErrorTextEl = document.getElementById("uploadErrorText");
+    const uploadErrorDetailsEl = document.getElementById("uploadErrorDetails");
+    const toggleUploadLogsEl = document.getElementById("toggleUploadLogs");
 
     let leafletMap = null;
     let georasterLayer = null;
@@ -277,6 +482,7 @@ INDEX_HTML = """<!doctype html>
     let cesiumViewer = null;
     let activeTileset = null;
     let activeButton = null;
+    const uploadJobs = new Map();
 
     function formatBytes(bytes) {
       if (typeof bytes !== "number" || Number.isNaN(bytes)) return "unknown size";
@@ -292,6 +498,46 @@ INDEX_HTML = """<!doctype html>
 
     function setStatus(message) {
       statusEl.textContent = message;
+    }
+
+    function clearUploadError() {
+      uploadErrorEl.style.display = "none";
+      uploadErrorTextEl.textContent = "";
+      uploadErrorDetailsEl.textContent = "";
+      uploadErrorDetailsEl.style.display = "none";
+      toggleUploadLogsEl.textContent = "Show Logs";
+    }
+
+    function showUploadError(errorText, detailsText) {
+      uploadErrorTextEl.textContent = "Error: " + errorText;
+      uploadErrorDetailsEl.textContent = detailsText || "No backend traceback provided.";
+      uploadErrorDetailsEl.style.display = "none";
+      toggleUploadLogsEl.textContent = "Show Logs";
+      uploadErrorEl.style.display = "block";
+    }
+
+    function renderUploadJobs() {
+      uploadJobsEl.innerHTML = "";
+      if (!uploadJobs.size) {
+        uploadJobsEl.innerHTML = '<div class="upload-job">No upload jobs yet.</div>';
+        return;
+      }
+      [...uploadJobs.values()].reverse().forEach((job) => {
+        const row = document.createElement("div");
+        row.className = "upload-job";
+        const progress = Number.isFinite(job.progress) ? Math.max(0, Math.min(100, job.progress)) : 0;
+        const progressLabel = progress.toFixed(1);
+        row.innerHTML = `
+          <div class="upload-job-head">
+            <div class="upload-job-name">${job.filename || "TIFF Upload"}</div>
+            <div class="upload-job-state">${job.status || "queued"}</div>
+          </div>
+          <div>${job.message || ""}</div>
+          <div class="upload-progress"><div class="upload-progress-bar" style="width:${progressLabel}%"></div></div>
+          <div class="upload-progress-text">${progressLabel}%</div>
+        `;
+        uploadJobsEl.appendChild(row);
+      });
     }
 
     function setActiveButton(btn) {
@@ -545,9 +791,87 @@ INDEX_HTML = """<!doctype html>
       setStatus("Scan complete. Found " + data.cogs.length + " COG(s), " + data.xyz_tiles.length + " XYZ dataset(s), and " + data.tilesets.length + " 3D Tileset(s).");
     }
 
+    async function pollUploadJobs() {
+      for (const [jobId] of uploadJobs.entries()) {
+        const res = await fetch("/api/upload-jobs/" + jobId);
+        if (!res.ok) continue;
+        const data = await res.json();
+        const prev = uploadJobs.get(jobId);
+        if (
+          prev &&
+          prev.status === "running" &&
+          data.status === "running" &&
+          Number.isFinite(prev.progress) &&
+          Number.isFinite(data.progress) &&
+          data.progress <= prev.progress
+        ) {
+          // Keep tiny forward movement for better realtime feedback.
+          data.progress = Math.min(99.5, prev.progress + 0.2);
+        }
+        uploadJobs.set(jobId, data);
+        if (data.status === "error") {
+          showUploadError(data.message || "Background processing failed.", data.details || "");
+          setStatus("Upload processing failed: " + (data.message || "Unknown error"));
+        }
+      }
+      renderUploadJobs();
+    }
+
+    async function uploadTiffFile(file) {
+      const body = new FormData();
+      body.append("file", file);
+      const res = await fetch("/upload", { method: "POST", body });
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (err) {
+        data = {};
+      }
+      if (!res.ok) {
+        throw {
+          error: data.error || "Upload failed",
+          details: data.details || ""
+        };
+      }
+      uploadJobs.set(data.job_id, data);
+      renderUploadJobs();
+      setStatus("Upload accepted: " + data.filename + ". XYZ generation started in background.");
+      clearUploadError();
+    }
+
+    uploadInput.addEventListener("change", async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      if (!(file.name.toLowerCase().endsWith(".tif") || file.name.toLowerCase().endsWith(".tiff"))) {
+        setStatus("Only .tif/.tiff files are supported.");
+        return;
+      }
+      try {
+        await uploadTiffFile(file);
+      } catch (error) {
+        const message = error && error.error ? error.error : "Upload failed.";
+        const details = error && error.details ? error.details : "";
+        setStatus("Upload failed: " + message);
+        showUploadError(message, details);
+      } finally {
+        e.target.value = "";
+      }
+    });
+
+    toggleUploadLogsEl.addEventListener("click", () => {
+      const isHidden = uploadErrorDetailsEl.style.display === "none";
+      uploadErrorDetailsEl.style.display = isHidden ? "block" : "none";
+      toggleUploadLogsEl.textContent = isHidden ? "Hide Logs" : "Show Logs";
+    });
+
     fetchDatasets().catch((error) => {
       setStatus("Error: " + error.message);
     });
+    renderUploadJobs();
+    setInterval(() => {
+      pollUploadJobs();
+      fetchDatasets().catch(() => {});
+    }, 3000);
   </script>
 </body>
 </html>
@@ -569,6 +893,138 @@ def list_datasets():
 def serve_outputs(subpath: str):
     ensure_output_directory()
     return send_from_directory(OUTPUT_DIR, subpath)
+
+
+def _allowed_upload(filename: str) -> bool:
+    return Path(filename).suffix.lower() in ALLOWED_UPLOAD_EXTENSIONS
+
+
+def _spawn_xyz_background_job(job_id: str, tif_path: Path) -> None:
+    log_path = UPLOAD_DIR / f"{job_id}.log"
+    runner_script = r"""
+import sys
+from pathlib import Path
+import web_optimizer_tool as w
+
+src = Path(sys.argv[1]).resolve()
+out_root = w.ensure_output_root()
+dataset_dir = out_root / f"{src.stem}_tiles"
+dataset_dir.mkdir(parents=True, exist_ok=True)
+
+with w.prepare_wgs84_source(src) as wgs84_src:
+    w.convert_tiff_to_xyz_tiles(wgs84_src, dataset_dir)
+
+zoom_levels = w.detect_xyz_zoom_levels(dataset_dir)
+bounds = w.raster_bounds_in_wgs84(src)
+w.write_metadata(dataset_dir, w.metadata_dict("2D", bounds=bounds, zoom_levels=zoom_levels))
+print("XYZ tiles ready at:", dataset_dir)
+"""
+    with open(log_path, "w", encoding="utf-8") as log_handle:
+        proc = subprocess.Popen(
+            [str(PYTHON_EXE), "-c", runner_script, str(tif_path)],
+            cwd=str(BASE_DIR),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    upload_jobs[job_id]["pid"] = str(proc.pid)
+    upload_jobs[job_id]["log"] = str(log_path)
+    upload_processes[job_id] = proc
+
+
+def _extract_progress_percent(log_text: str, fallback: int = 0) -> int:
+    percent = fallback
+    for line in log_text.splitlines():
+        lowered = line.lower()
+        if "auto-reprojecting" in lowered:
+            percent = max(percent, 12)
+        if "xyz tiles ready at:" in lowered:
+            percent = 100
+        for token in line.replace("...", " ").split():
+            if token.endswith("%"):
+                digits = token[:-1].strip()
+                if digits.isdigit():
+                    value = int(digits)
+                    if 0 <= value <= 100:
+                        percent = max(percent, value)
+    return max(0, min(100, percent))
+
+
+def _refresh_upload_job(job_id: str) -> None:
+    job = upload_jobs.get(job_id)
+    if not job or job["status"] in {"success", "error"}:
+        return
+    proc = upload_processes.get(job_id)
+    if proc and proc.poll() is None:
+        job["status"] = "running"
+        job["message"] = "XYZ tiles generation in progress..."
+        try:
+            running_log = Path(job["log"]).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            running_log = ""
+        job["progress"] = _extract_progress_percent(running_log, fallback=int(job.get("progress", 15)))
+        return
+
+    log_text = ""
+    try:
+        log_text = Path(job["log"]).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        pass
+    if "XYZ tiles ready at:" in log_text:
+        job["status"] = "success"
+        job["message"] = "Completed. Dataset available in survey_outputs."
+        job["details"] = ""
+        job["progress"] = 100
+    else:
+        job["status"] = "error"
+        log_lines = [line for line in log_text.splitlines() if line.strip()]
+        summary_line = "Background process failed."
+        for line in reversed(log_lines):
+            if "Error" in line or "Exception" in line or "Traceback" in line or "WinError" in line:
+                summary_line = line.strip()
+                break
+        job["message"] = summary_line
+        job["details"] = log_text[-8000:] if log_text else "No log output found."
+        job["progress"] = _extract_progress_percent(log_text, fallback=int(job.get("progress", 0)))
+
+
+@app.route("/upload", methods=["POST"])
+def upload_tiff():
+    try:
+        if not PYTHON_EXE.exists():
+            raise RuntimeError(f"Python executable not found at {PYTHON_EXE}")
+        if "file" not in request.files:
+            return jsonify({"error": "No file found in request."}), 400
+        uploaded_file = request.files["file"]
+        if not uploaded_file.filename:
+            return jsonify({"error": "No file selected."}), 400
+        if not _allowed_upload(uploaded_file.filename):
+            return jsonify({"error": "Only .tif/.tiff uploads are allowed."}), 400
+
+        filename = secure_filename(uploaded_file.filename)
+        target_path = UPLOAD_DIR / filename
+        uploaded_file.save(target_path)
+
+        job_id = str(uuid.uuid4())
+        upload_jobs[job_id] = {
+            "job_id": job_id,
+            "filename": filename,
+            "status": "queued",
+            "message": "Upload complete. Job queued.",
+            "progress": 5,
+        }
+        _spawn_xyz_background_job(job_id, target_path)
+        return jsonify(upload_jobs[job_id]), 202
+    except Exception as exc:
+        return jsonify({"error": str(exc), "details": traceback.format_exc()}), 500
+
+
+@app.route("/api/upload-jobs/<job_id>", methods=["GET"])
+def upload_job_status(job_id: str):
+    if job_id not in upload_jobs:
+        return jsonify({"error": "Job not found."}), 404
+    _refresh_upload_job(job_id)
+    return jsonify(upload_jobs[job_id])
 
 
 def print_startup_banner() -> None:

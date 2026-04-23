@@ -268,18 +268,19 @@ def convert_tiff_to_cog_with_gdal(src: Path, dst: Path) -> None:
 def convert_tiff_to_xyz_tiles(src_tif: Path, output_tiles_dir: Path) -> None:
     output_tiles_dir.mkdir(parents=True, exist_ok=True)
     candidate_cmds = [
-        ["gdal2tiles.py", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
+        [sys.executable, "-m", "gdal2tiles", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
+        [sys.executable, "gdal2tiles.py", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
         ["gdal2tiles", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
         ["gdal2tiles.bat", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
-        [sys.executable, "-m", "gdal2tiles", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
+        ["gdal2tiles.py", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
     ]
 
     last_error: str | None = None
     for cmd in candidate_cmds:
         try:
             completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        except FileNotFoundError:
-            last_error = "Command binary not found."
+        except (FileNotFoundError, OSError) as exc:
+            last_error = f"Command failed to start: {' '.join(cmd)}\n{exc}"
             continue
 
         if completed.returncode == 0:

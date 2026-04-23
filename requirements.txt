@@ -1,6 +1,6 @@
 colorama
 tqdm
-rasterio
 py3dtiles
 Flask
 flask-cors
+shapely
