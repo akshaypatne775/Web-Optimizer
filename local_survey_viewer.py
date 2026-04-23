@@ -1,4 +1,4 @@
-import os
+import json
 from pathlib import Path
 from typing import Dict, List
 
@@ -23,38 +23,81 @@ def posix_relative(path: Path) -> str:
 def detect_datasets() -> Dict[str, List[Dict[str, str]]]:
     cogs: List[Dict[str, str]] = []
     tilesets: List[Dict[str, str]] = []
+    xyz_tiles: List[Dict[str, str]] = []
 
-    for tif_path in OUTPUT_DIR.rglob("*"):
-        if tif_path.is_file() and tif_path.suffix.lower() in {".tif", ".tiff"}:
-            rel_path = posix_relative(tif_path)
+    for metadata_path in OUTPUT_DIR.rglob("metadata.json"):
+        if not metadata_path.is_file():
+            continue
+
+        dataset_dir = metadata_path.parent
+        rel_dataset_dir = posix_relative(dataset_dir)
+        rel_metadata_path = posix_relative(metadata_path)
+        metadata_url = f"/outputs/{rel_metadata_path}"
+        dataset_name = rel_dataset_dir or dataset_dir.name
+
+        metadata: Dict[str, object] = {}
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+
+        tileset_json = dataset_dir / "tileset.json"
+        if tileset_json.exists():
+            rel_tileset = posix_relative(tileset_json)
+            tilesets.append(
+                {
+                    "name": dataset_name,
+                    "path": rel_dataset_dir,
+                    "tileset_url": f"/outputs/{rel_tileset}",
+                    "metadata_url": metadata_url,
+                    "type": "3dtiles",
+                }
+            )
+            continue
+
+        tif_candidates = [p for p in dataset_dir.iterdir() if p.is_file() and p.suffix.lower() in {".tif", ".tiff"}]
+        if tif_candidates:
+            tif_path = tif_candidates[0]
+            rel_tif = posix_relative(tif_path)
             cogs.append(
                 {
-                    "name": tif_path.name,
-                    "path": rel_path,
-                    "url": f"/outputs/{rel_path}",
+                    "name": dataset_name,
+                    "path": rel_dataset_dir,
+                    "url": f"/outputs/{rel_tif}",
                     "size_bytes": tif_path.stat().st_size,
+                    "metadata_url": metadata_url,
                     "type": "cog",
                 }
             )
+            continue
 
-    for tileset_json in OUTPUT_DIR.rglob("tileset.json"):
-        if tileset_json.is_file():
-            folder = tileset_json.parent
-            rel_folder = posix_relative(folder)
-            rel_tileset = posix_relative(tileset_json)
-            display_name = rel_folder if rel_folder else folder.name
-            tilesets.append(
+        zoom_levels = metadata.get("zoom_levels", {}) if isinstance(metadata, dict) else {}
+        min_zoom = zoom_levels.get("min") if isinstance(zoom_levels, dict) else None
+        tile_probe = None
+        if isinstance(min_zoom, int):
+            z_path = dataset_dir / str(min_zoom)
+            if z_path.exists():
+                x_dirs = [x for x in z_path.iterdir() if x.is_dir() and x.name.isdigit()]
+                if x_dirs:
+                    y_files = [f for f in x_dirs[0].iterdir() if f.is_file() and f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}]
+                    if y_files:
+                        tile_probe = y_files[0]
+
+        if tile_probe:
+            xyz_tiles.append(
                 {
-                    "name": display_name,
-                    "path": rel_folder,
-                    "tileset_url": f"/outputs/{rel_tileset}",
-                    "type": "3dtiles",
+                    "name": dataset_name,
+                    "path": rel_dataset_dir,
+                    "tile_url_template": f"/outputs/{rel_dataset_dir}/{{z}}/{{x}}/{{y}}.png",
+                    "metadata_url": metadata_url,
+                    "type": "xyz",
                 }
             )
 
     cogs.sort(key=lambda d: d["path"].lower())
     tilesets.sort(key=lambda d: d["path"].lower())
-    return {"cogs": cogs, "tilesets": tilesets}
+    xyz_tiles.sort(key=lambda d: d["path"].lower())
+    return {"cogs": cogs, "tilesets": tilesets, "xyz_tiles": xyz_tiles}
 
 
 app = Flask(__name__)
@@ -230,6 +273,7 @@ INDEX_HTML = """<!doctype html>
 
     let leafletMap = null;
     let georasterLayer = null;
+    let xyzLayer = null;
     let cesiumViewer = null;
     let activeTileset = null;
     let activeButton = null;
@@ -308,85 +352,123 @@ INDEX_HTML = """<!doctype html>
         leafletMap.removeLayer(georasterLayer);
         georasterLayer = null;
       }
+      if (xyzLayer && leafletMap) {
+        leafletMap.removeLayer(xyzLayer);
+        xyzLayer = null;
+      }
       if (activeTileset && cesiumViewer) {
         cesiumViewer.scene.primitives.remove(activeTileset);
         activeTileset = null;
       }
     }
 
-    async function forceZoomToRaster(map, layer, georaster) {
-      const maxAttempts = 20;
-      const delayMs = 120;
+    async function fetchMetadata(metadataUrl) {
+      if (!metadataUrl) return null;
+      const res = await fetch(metadataUrl);
+      if (!res.ok) throw new Error("Failed to load metadata.json");
+      return await res.json();
+    }
 
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        map.invalidateSize();
-        const layerBounds = layer && layer.getBounds ? layer.getBounds() : null;
-        if (layerBounds && layerBounds.isValid && layerBounds.isValid()) {
-          map.flyToBounds(layerBounds, { padding: [20, 20], duration: 0.9, maxZoom: 19 });
-          return true;
-        }
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+    function metadataToLeafletBounds(metadata) {
+      const sw = metadata && metadata.bounds && metadata.bounds.southwest;
+      const ne = metadata && metadata.bounds && metadata.bounds.northeast;
+      if (!sw || !ne) return null;
+      return L.latLngBounds([sw.lat, sw.lon], [ne.lat, ne.lon]);
+    }
+
+    function applyLeafletBounds(map, metadata) {
+      const bounds = metadataToLeafletBounds(metadata);
+      if (bounds && bounds.isValid && bounds.isValid()) {
+        const zoomMax = metadata && metadata.zoom_levels && Number.isFinite(metadata.zoom_levels.max)
+          ? metadata.zoom_levels.max
+          : 22;
+        map.flyToBounds(bounds, { padding: [20, 20], duration: 0.9, maxZoom: zoomMax });
+        return true;
       }
-
-      if (
-        typeof georaster.ymin === "number" &&
-        typeof georaster.xmin === "number" &&
-        typeof georaster.ymax === "number" &&
-        typeof georaster.xmax === "number"
-      ) {
-        const fallbackBounds = L.latLngBounds(
-          [georaster.ymin, georaster.xmin],
-          [georaster.ymax, georaster.xmax]
-        );
-        if (fallbackBounds.isValid && fallbackBounds.isValid()) {
-          map.flyToBounds(fallbackBounds, { padding: [20, 20], duration: 0.9, maxZoom: 19 });
-          return true;
-        }
-      }
-
       return false;
     }
 
-    async function loadCOG(url, sizeBytes) {
-      setStatus("Loading COG raster...");
+    function applyCesiumBoundsOrCenter(viewer, metadata) {
+      if (metadata && metadata.bounds && metadata.bounds.southwest && metadata.bounds.northeast) {
+        const sw = metadata.bounds.southwest;
+        const ne = metadata.bounds.northeast;
+        viewer.camera.flyTo({
+          destination: Cesium.Rectangle.fromDegrees(sw.lon, sw.lat, ne.lon, ne.lat),
+          duration: 1.2
+        });
+        return;
+      }
+      if (metadata && metadata.center) {
+        viewer.camera.flyTo({
+          destination: Cesium.Cartesian3.fromDegrees(metadata.center.lon, metadata.center.lat, 2000),
+          duration: 1.2
+        });
+      }
+    }
+
+    async function loadCOG(url, metadataUrl, sizeBytes) {
+      setStatus("Loading COG raster via stream...");
       const map = ensureLeafletMap();
       showLeaflet();
       clearViewers();
 
-      if (typeof sizeBytes === "number" && sizeBytes > 700 * 1024 * 1024) {
-        setStatus("Large TIFF detected (" + formatBytes(sizeBytes) + "). Loading may take time or fail in browser memory.");
-      }
+      try {
+        const metadata = await fetchMetadata(metadataUrl);
+        const georaster = await parseGeoraster(url);
 
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error("Failed to fetch TIFF (" + response.status + ")");
-      }
-      const arrayBuffer = await response.arrayBuffer();
-      const georaster = await parseGeoraster(arrayBuffer);
+        georasterLayer = new GeoRasterLayer({
+          georaster: georaster,
+          resolution: 256
+        });
+        georasterLayer.addTo(map);
 
-      georasterLayer = new GeoRasterLayer({
-        georaster: georaster,
-        resolution: 256
-      });
-      georasterLayer.addTo(map);
-      const zoomed = await forceZoomToRaster(map, georasterLayer, georaster);
-      if (zoomed) {
-        setStatus("COG loaded successfully (auto-zoom applied).");
-      } else {
-        setStatus("COG loaded, but auto-zoom unavailable. TIFF may be missing valid georeference bounds/CRS.");
+        const zoomedFromMetadata = applyLeafletBounds(map, metadata);
+        if (!zoomedFromMetadata && georasterLayer.getBounds && georasterLayer.getBounds().isValid()) {
+          map.fitBounds(georasterLayer.getBounds(), { padding: [20, 20] });
+        }
+
+        if (zoomedFromMetadata) {
+          setStatus("COG loaded successfully (metadata-driven auto-zoom).");
+        } else {
+          setStatus("COG loaded successfully.");
+        }
+      } catch (err) {
+        setStatus("Error loading COG: " + err.message);
+        console.error(err);
       }
     }
 
-    async function load3DTiles(tilesetUrl) {
+    async function loadXYZTiles(tileTemplateUrl, metadataUrl) {
+      setStatus("Loading XYZ tile layer...");
+      const map = ensureLeafletMap();
+      showLeaflet();
+      clearViewers();
+
+      const metadata = await fetchMetadata(metadataUrl);
+      const zoomMin = metadata && metadata.zoom_levels && Number.isFinite(metadata.zoom_levels.min) ? metadata.zoom_levels.min : 0;
+      const zoomMax = metadata && metadata.zoom_levels && Number.isFinite(metadata.zoom_levels.max) ? metadata.zoom_levels.max : 22;
+
+      xyzLayer = L.tileLayer(tileTemplateUrl, {
+        minZoom: zoomMin,
+        maxZoom: zoomMax,
+        tileSize: 256
+      });
+      xyzLayer.addTo(map);
+      applyLeafletBounds(map, metadata);
+      setStatus("XYZ tiles loaded successfully.");
+    }
+
+    async function load3DTiles(tilesetUrl, metadataUrl) {
       setStatus("Loading Cesium 3D Tiles...");
       const viewer = ensureCesiumViewer();
       showCesium();
       clearViewers();
+      const metadata = await fetchMetadata(metadataUrl);
 
       activeTileset = await Cesium.Cesium3DTileset.fromUrl(tilesetUrl);
       viewer.scene.primitives.add(activeTileset);
-      await viewer.zoomTo(activeTileset);
-      setStatus("3D Tiles loaded successfully.");
+      applyCesiumBoundsOrCenter(viewer, metadata);
+      setStatus("3D Tiles loaded successfully (metadata-driven camera fly-to).");
     }
 
     function createDatasetButton(label, onClick) {
@@ -433,9 +515,19 @@ INDEX_HTML = """<!doctype html>
       renderGroup("Cloud Optimized GeoTIFF", data.cogs, (item) =>
         createDatasetButton(item.path + " (" + formatBytes(item.size_bytes) + ")", async () => {
           try {
-            await loadCOG(item.url, item.size_bytes);
+            await loadCOG(item.url, item.metadata_url, item.size_bytes);
           } catch (error) {
             setStatus("Failed to load COG: " + error.message);
+          }
+        })
+      );
+
+      renderGroup("XYZ Map Tiles", data.xyz_tiles, (item) =>
+        createDatasetButton(item.path, async () => {
+          try {
+            await loadXYZTiles(item.tile_url_template, item.metadata_url);
+          } catch (error) {
+            setStatus("Failed to load XYZ tiles: " + error.message);
           }
         })
       );
@@ -443,14 +535,14 @@ INDEX_HTML = """<!doctype html>
       renderGroup("Cesium 3D Tiles", data.tilesets, (item) =>
         createDatasetButton(item.path, async () => {
           try {
-            await load3DTiles(item.tileset_url);
+            await load3DTiles(item.tileset_url, item.metadata_url);
           } catch (error) {
             setStatus("Failed to load 3D Tiles: " + error.message);
           }
         })
       );
 
-      setStatus("Scan complete. Found " + data.cogs.length + " COG(s) and " + data.tilesets.length + " 3D Tileset(s).");
+      setStatus("Scan complete. Found " + data.cogs.length + " COG(s), " + data.xyz_tiles.length + " XYZ dataset(s), and " + data.tilesets.length + " 3D Tileset(s).");
     }
 
     fetchDatasets().catch((error) => {
