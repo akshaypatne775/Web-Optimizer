@@ -254,6 +254,54 @@ INDEX_HTML = """<!doctype html>
       display: none;
     }
 
+    .upload-options {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .upload-options select {
+      background: #153b46;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-family: "Montserrat", sans-serif;
+      font-size: 11px;
+    }
+
+    .path-runner {
+      margin-top: 8px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px;
+    }
+
+    .path-runner input {
+      background: #153b46;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-family: "Montserrat", sans-serif;
+      font-size: 11px;
+    }
+
+    .path-runner button {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #1b4e5d;
+      color: var(--text);
+      padding: 6px 10px;
+      font-family: "Montserrat", sans-serif;
+      font-size: 11px;
+      cursor: pointer;
+    }
+
     .upload-job-list {
       margin-top: 10px;
       max-height: 120px;
@@ -437,6 +485,25 @@ INDEX_HTML = """<!doctype html>
           Drag/Click to upload .tif/.tiff
           <input id="uploadInput" type="file" accept=".tif,.tiff" />
         </label>
+        <div class="upload-options">
+          <span><i class="fa-solid fa-gauge-high"></i> Tiling speed mode</span>
+          <select id="resamplingMode">
+            <option value="bilinear">Balanced (bilinear)</option>
+            <option value="near" selected>Fast (near)</option>
+          </select>
+        </div>
+        <div class="upload-options">
+          <span><i class="fa-solid fa-bolt"></i> Processing profile</span>
+          <select id="processingProfile">
+            <option value="turbo" selected>Turbo (100GB+)</option>
+            <option value="balanced">Balanced</option>
+            <option value="full">Full detail (slow)</option>
+          </select>
+        </div>
+        <div class="path-runner">
+          <input id="localTiffPath" type="text" placeholder="D:\\data\\very_large_map.tif (recommended for 100GB+)" />
+          <button id="runFromPathBtn" type="button"><i class="fa-solid fa-play"></i> Run</button>
+        </div>
         <div id="uploadJobs" class="upload-job-list"></div>
         <div id="uploadError" class="upload-error">
           <div id="uploadErrorText"></div>
@@ -475,6 +542,10 @@ INDEX_HTML = """<!doctype html>
     const uploadErrorTextEl = document.getElementById("uploadErrorText");
     const uploadErrorDetailsEl = document.getElementById("uploadErrorDetails");
     const toggleUploadLogsEl = document.getElementById("toggleUploadLogs");
+    const resamplingModeEl = document.getElementById("resamplingMode");
+    const processingProfileEl = document.getElementById("processingProfile");
+    const localTiffPathEl = document.getElementById("localTiffPath");
+    const runFromPathBtnEl = document.getElementById("runFromPathBtn");
 
     let leafletMap = null;
     let georasterLayer = null;
@@ -694,14 +765,19 @@ INDEX_HTML = """<!doctype html>
       const zoomMin = metadata && metadata.zoom_levels && Number.isFinite(metadata.zoom_levels.min) ? metadata.zoom_levels.min : 0;
       const zoomMax = metadata && metadata.zoom_levels && Number.isFinite(metadata.zoom_levels.max) ? metadata.zoom_levels.max : 22;
 
+      // Keep tiles visible even when user zooms beyond generated max level.
+      map.setMinZoom(zoomMin);
+      map.setMaxZoom(24);
       xyzLayer = L.tileLayer(tileTemplateUrl, {
         minZoom: zoomMin,
-        maxZoom: zoomMax,
-        tileSize: 256
+        maxNativeZoom: zoomMax,
+        maxZoom: 24,
+        tileSize: 256,
+        updateWhenZooming: false
       });
       xyzLayer.addTo(map);
       applyLeafletBounds(map, metadata);
-      setStatus("XYZ tiles loaded successfully.");
+      setStatus("XYZ tiles loaded successfully. Native max zoom: " + zoomMax + " (over-zoom enabled).");
     }
 
     async function load3DTiles(tilesetUrl, metadataUrl) {
@@ -820,6 +896,8 @@ INDEX_HTML = """<!doctype html>
     async function uploadTiffFile(file) {
       const body = new FormData();
       body.append("file", file);
+      body.append("resampling", resamplingModeEl.value || "bilinear");
+      body.append("profile", processingProfileEl.value || "turbo");
       const res = await fetch("/upload", { method: "POST", body });
       let data = {};
       try {
@@ -836,6 +914,29 @@ INDEX_HTML = """<!doctype html>
       uploadJobs.set(data.job_id, data);
       renderUploadJobs();
       setStatus("Upload accepted: " + data.filename + ". XYZ generation started in background.");
+      clearUploadError();
+    }
+
+    async function runFromLocalPath(pathValue) {
+      const res = await fetch("/process-file", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: pathValue,
+          resampling: resamplingModeEl.value || "near",
+          profile: processingProfileEl.value || "turbo"
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw {
+          error: data.error || "Failed to start local file processing.",
+          details: data.details || ""
+        };
+      }
+      uploadJobs.set(data.job_id, data);
+      renderUploadJobs();
+      setStatus("Local TIFF queued: " + (data.filename || pathValue));
       clearUploadError();
     }
 
@@ -862,6 +963,22 @@ INDEX_HTML = """<!doctype html>
       const isHidden = uploadErrorDetailsEl.style.display === "none";
       uploadErrorDetailsEl.style.display = isHidden ? "block" : "none";
       toggleUploadLogsEl.textContent = isHidden ? "Hide Logs" : "Show Logs";
+    });
+
+    runFromPathBtnEl.addEventListener("click", async () => {
+      const pathValue = (localTiffPathEl.value || "").trim();
+      if (!pathValue) {
+        setStatus("Enter local TIFF path first.");
+        return;
+      }
+      try {
+        await runFromLocalPath(pathValue);
+      } catch (error) {
+        const message = error && error.error ? error.error : "Failed to process local path.";
+        const details = error && error.details ? error.details : "";
+        setStatus("Path processing failed: " + message);
+        showUploadError(message, details);
+      }
     });
 
     fetchDatasets().catch((error) => {
@@ -899,7 +1016,7 @@ def _allowed_upload(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_UPLOAD_EXTENSIONS
 
 
-def _spawn_xyz_background_job(job_id: str, tif_path: Path) -> None:
+def _spawn_xyz_background_job(job_id: str, tif_path: Path, resampling: str, zoom_range: str, skip_reproject: bool) -> None:
     log_path = UPLOAD_DIR / f"{job_id}.log"
     runner_script = r"""
 import sys
@@ -907,21 +1024,30 @@ from pathlib import Path
 import web_optimizer_tool as w
 
 src = Path(sys.argv[1]).resolve()
+resampling = sys.argv[2] if len(sys.argv) > 2 else "bilinear"
+zoom_range = sys.argv[3] if len(sys.argv) > 3 else ""
+skip_reproject = (sys.argv[4].lower() == "true") if len(sys.argv) > 4 else False
 out_root = w.ensure_output_root()
 dataset_dir = out_root / f"{src.stem}_tiles"
 dataset_dir.mkdir(parents=True, exist_ok=True)
 
-with w.prepare_wgs84_source(src) as wgs84_src:
-    w.convert_tiff_to_xyz_tiles(wgs84_src, dataset_dir)
+if skip_reproject:
+    w.convert_tiff_to_xyz_tiles(src, dataset_dir, resampling=resampling, zoom=zoom_range or None)
+else:
+    with w.prepare_wgs84_source(src) as wgs84_src:
+        w.convert_tiff_to_xyz_tiles(wgs84_src, dataset_dir, resampling=resampling, zoom=zoom_range or None)
 
 zoom_levels = w.detect_xyz_zoom_levels(dataset_dir)
 bounds = w.raster_bounds_in_wgs84(src)
 w.write_metadata(dataset_dir, w.metadata_dict("2D", bounds=bounds, zoom_levels=zoom_levels))
 print("XYZ tiles ready at:", dataset_dir)
 """
+    safe_resampling = resampling if resampling in {"bilinear", "near"} else "bilinear"
+    safe_zoom = zoom_range.strip()
+    skip_arg = "true" if skip_reproject else "false"
     with open(log_path, "w", encoding="utf-8") as log_handle:
         proc = subprocess.Popen(
-            [str(PYTHON_EXE), "-c", runner_script, str(tif_path)],
+            [str(PYTHON_EXE), "-c", runner_script, str(tif_path), safe_resampling, safe_zoom, skip_arg],
             cwd=str(BASE_DIR),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -932,7 +1058,7 @@ print("XYZ tiles ready at:", dataset_dir)
     upload_processes[job_id] = proc
 
 
-def _extract_progress_percent(log_text: str, fallback: int = 0) -> int:
+def _extract_progress_percent(log_text: str, fallback: float = 0.0) -> float:
     percent = fallback
     for line in log_text.splitlines():
         lowered = line.lower()
@@ -943,10 +1069,12 @@ def _extract_progress_percent(log_text: str, fallback: int = 0) -> int:
         for token in line.replace("...", " ").split():
             if token.endswith("%"):
                 digits = token[:-1].strip()
-                if digits.isdigit():
-                    value = int(digits)
-                    if 0 <= value <= 100:
-                        percent = max(percent, value)
+                try:
+                    value = float(digits)
+                except ValueError:
+                    value = -1.0
+                if 0 <= value <= 100:
+                    percent = max(percent, value)
     return max(0, min(100, percent))
 
 
@@ -962,7 +1090,7 @@ def _refresh_upload_job(job_id: str) -> None:
             running_log = Path(job["log"]).read_text(encoding="utf-8", errors="ignore")
         except Exception:
             running_log = ""
-        job["progress"] = _extract_progress_percent(running_log, fallback=int(job.get("progress", 15)))
+        job["progress"] = _extract_progress_percent(running_log, fallback=float(job.get("progress", 15.0)))
         return
 
     log_text = ""
@@ -985,7 +1113,7 @@ def _refresh_upload_job(job_id: str) -> None:
                 break
         job["message"] = summary_line
         job["details"] = log_text[-8000:] if log_text else "No log output found."
-        job["progress"] = _extract_progress_percent(log_text, fallback=int(job.get("progress", 0)))
+        job["progress"] = _extract_progress_percent(log_text, fallback=float(job.get("progress", 0.0)))
 
 
 @app.route("/upload", methods=["POST"])
@@ -1000,6 +1128,19 @@ def upload_tiff():
             return jsonify({"error": "No file selected."}), 400
         if not _allowed_upload(uploaded_file.filename):
             return jsonify({"error": "Only .tif/.tiff uploads are allowed."}), 400
+        resampling = request.form.get("resampling", "near").strip().lower()
+        if resampling not in {"bilinear", "near"}:
+            resampling = "near"
+        profile = request.form.get("profile", "turbo").strip().lower()
+        if profile == "full":
+            zoom_range = ""
+            skip_reproject = False
+        elif profile == "balanced":
+            zoom_range = "0-19"
+            skip_reproject = False
+        else:
+            zoom_range = "0-16"
+            skip_reproject = True
 
         filename = secure_filename(uploaded_file.filename)
         target_path = UPLOAD_DIR / filename
@@ -1010,10 +1151,53 @@ def upload_tiff():
             "job_id": job_id,
             "filename": filename,
             "status": "queued",
-            "message": "Upload complete. Job queued.",
+            "message": f"Upload queued ({profile}, {resampling}, zoom={zoom_range or 'auto'}).",
             "progress": 5,
         }
-        _spawn_xyz_background_job(job_id, target_path)
+        _spawn_xyz_background_job(job_id, target_path, resampling, zoom_range, skip_reproject)
+        return jsonify(upload_jobs[job_id]), 202
+    except Exception as exc:
+        return jsonify({"error": str(exc), "details": traceback.format_exc()}), 500
+
+
+@app.route("/process-file", methods=["POST"])
+def process_local_file():
+    try:
+        if not PYTHON_EXE.exists():
+            raise RuntimeError(f"Python executable not found at {PYTHON_EXE}")
+        payload = request.get_json(silent=True) or {}
+        path_value = str(payload.get("path", "")).strip()
+        if not path_value:
+            return jsonify({"error": "Missing 'path' in request body."}), 400
+        tif_path = Path(path_value).expanduser().resolve()
+        if not tif_path.exists() or not tif_path.is_file():
+            return jsonify({"error": f"File not found: {tif_path}"}), 400
+        if tif_path.suffix.lower() not in ALLOWED_UPLOAD_EXTENSIONS:
+            return jsonify({"error": "Only .tif/.tiff files are allowed."}), 400
+
+        resampling = str(payload.get("resampling", "near")).strip().lower()
+        if resampling not in {"bilinear", "near"}:
+            resampling = "near"
+        profile = str(payload.get("profile", "turbo")).strip().lower()
+        if profile == "full":
+            zoom_range = ""
+            skip_reproject = False
+        elif profile == "balanced":
+            zoom_range = "0-19"
+            skip_reproject = False
+        else:
+            zoom_range = "0-16"
+            skip_reproject = True
+
+        job_id = str(uuid.uuid4())
+        upload_jobs[job_id] = {
+            "job_id": job_id,
+            "filename": tif_path.name,
+            "status": "queued",
+            "message": f"Local file queued ({profile}, {resampling}, zoom={zoom_range or 'auto'}).",
+            "progress": 5,
+        }
+        _spawn_xyz_background_job(job_id, tif_path, resampling, zoom_range, skip_reproject)
         return jsonify(upload_jobs[job_id]), 202
     except Exception as exc:
         return jsonify({"error": str(exc), "details": traceback.format_exc()}), 500

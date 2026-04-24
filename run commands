@@ -1,0 +1,3 @@
+conda activate ./venv
+python local_survey_viewer.py
+if needed : call "C:\ProgramData\miniconda3\Scripts\activate.bat" "D:\1_Portal_Workflows_development\Web-Optimizer\venv"

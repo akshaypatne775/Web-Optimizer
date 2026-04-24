@@ -10,6 +10,8 @@ Automates conversion of heavy drone survey data into web-streaming formats:
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import shutil
 import subprocess
 import sys
@@ -65,6 +67,21 @@ def print_success(msg: str) -> None:
 
 def print_info(msg: str) -> None:
     print(f"{CYAN}[INFO]{RESET} {msg}")
+
+
+def _cpu_count() -> int:
+    return max(1, multiprocessing.cpu_count())
+
+
+def _gdal_parallel_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    cores = str(_cpu_count())
+    env["GDAL_NUM_THREADS"] = "ALL_CPUS"
+    env["NUM_THREADS"] = "ALL_CPUS"
+    env["OMP_NUM_THREADS"] = cores
+    env["CPL_NUM_THREADS"] = cores
+    env["CPL_CPU_COUNT"] = cores
+    return env
 
 
 def ensure_output_root() -> Path:
@@ -207,6 +224,7 @@ def prepare_wgs84_source(src: Path) -> Iterator[Path]:
                     dst_transform=transform,
                     dst_crs=CRS.from_epsg(WGS84_EPSG),
                     resampling=Resampling.bilinear,
+                    num_threads=_cpu_count(),
                 )
     try:
         yield temp_path
@@ -265,20 +283,30 @@ def convert_tiff_to_cog_with_gdal(src: Path, dst: Path) -> None:
         )
 
 
-def convert_tiff_to_xyz_tiles(src_tif: Path, output_tiles_dir: Path) -> None:
+def convert_tiff_to_xyz_tiles(
+    src_tif: Path,
+    output_tiles_dir: Path,
+    resampling: str = "bilinear",
+    zoom: str | None = None,
+) -> None:
     output_tiles_dir.mkdir(parents=True, exist_ok=True)
+    safe_resampling = resampling if resampling in {"bilinear", "near"} else "bilinear"
+    cores = _cpu_count()
+    process_arg = f"--processes={cores}"
+    zoom_args: List[str] = ["--zoom", zoom] if zoom else []
+    gdal_env = _gdal_parallel_env()
     candidate_cmds = [
-        [sys.executable, "-m", "gdal2tiles", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
-        [sys.executable, "gdal2tiles.py", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
-        ["gdal2tiles", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
-        ["gdal2tiles.bat", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
-        ["gdal2tiles.py", "-w", "none", "-r", "bilinear", str(src_tif), str(output_tiles_dir)],
+        [sys.executable, "-m", "gdal2tiles", process_arg, "--xyz", "--resume", "-w", "none", "-r", safe_resampling, *zoom_args, str(src_tif), str(output_tiles_dir)],
+        [sys.executable, "gdal2tiles.py", process_arg, "--xyz", "--resume", "-w", "none", "-r", safe_resampling, *zoom_args, str(src_tif), str(output_tiles_dir)],
+        ["gdal2tiles", process_arg, "--xyz", "--resume", "-w", "none", "-r", safe_resampling, *zoom_args, str(src_tif), str(output_tiles_dir)],
+        ["gdal2tiles.bat", process_arg, "--xyz", "--resume", "-w", "none", "-r", safe_resampling, *zoom_args, str(src_tif), str(output_tiles_dir)],
+        ["gdal2tiles.py", process_arg, "--xyz", "--resume", "-w", "none", "-r", safe_resampling, *zoom_args, str(src_tif), str(output_tiles_dir)],
     ]
 
     last_error: str | None = None
     for cmd in candidate_cmds:
         try:
-            completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            completed = subprocess.run(cmd, capture_output=True, text=True, check=False, env=gdal_env)
         except (FileNotFoundError, OSError) as exc:
             last_error = f"Command failed to start: {' '.join(cmd)}\n{exc}"
             continue
